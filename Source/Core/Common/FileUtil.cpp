@@ -700,7 +700,8 @@ std::string GetBundleDirectory()
   }
 
   bool is_translocated = false;
-  s_is_translocated_url(bundle_ref, &is_translocated, nullptr);
+  if (s_is_translocated_url)  // not on iOS
+    s_is_translocated_url(bundle_ref, &is_translocated, nullptr);
 
   if (is_translocated)
   {

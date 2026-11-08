@@ -327,7 +327,7 @@ if(WIN32)
   if(MSVC)
     target_sources(common PRIVATE CompatPatches.cpp)
   endif()
-elseif(APPLE)
+elseif(APPLE AND NOT IOS)
   target_sources(common PRIVATE
     GL/GLInterface/AGL.h
     GL/GLInterface/AGL.mm

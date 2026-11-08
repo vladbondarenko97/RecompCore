@@ -113,7 +113,7 @@ if(WIN32)
     )
   endif()
   target_link_libraries(inputcommon PRIVATE cfgmgr32.lib dinput8.lib dxguid.lib)
-elseif(APPLE)
+elseif(APPLE AND NOT IOS)
   target_sources(inputcommon PRIVATE
     ControllerInterface/Quartz/Quartz.h
     ControllerInterface/Quartz/Quartz.mm
@@ -149,7 +149,7 @@ elseif(ANDROID)
   )
 endif()
 
-if(NOT ANDROID)
+if(TARGET LibUSB::LibUSB)
   target_link_libraries(inputcommon PUBLIC LibUSB::LibUSB)
 endif()
 

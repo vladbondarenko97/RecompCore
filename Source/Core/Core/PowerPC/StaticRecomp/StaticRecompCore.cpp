@@ -185,7 +185,9 @@ void StaticRecompCore::Init()
   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
   m_lockstep_verifier->Init();
 
-#ifdef _M_ARM_64
+#if defined(IPHONEOS)
+  // No JIT on iOS: what the module does not cover runs on the interpreter.
+#elif defined(_M_ARM_64)
   m_fallback_jit = std::make_unique<JitArm64>(m_system);
 #elif defined(_M_X86_64)
   m_fallback_jit = std::make_unique<Jit64>(m_system);
@@ -358,4 +360,10 @@ void StaticRecompCore::ClearCache()
   std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
   m_failed_chunks = 0;
   ++m_reverify_events;
+}
+
+void StaticRecompPerfCounters(u64* native, u64* fallback)
+{
+  *native = g_static_recomp_core ? g_static_recomp_core->NativeDispatches() : 0;
+  *fallback = g_static_recomp_core ? g_static_recomp_core->FallbackSteps() : 0;
 }

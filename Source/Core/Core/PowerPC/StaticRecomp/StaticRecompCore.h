@@ -61,6 +61,9 @@ public:
   bool HandleFault(uintptr_t access_address, SContext* ctx) override { return false; }
 
   JitBaseBlockCache* GetBlockCache() override { return &m_block_cache; }
+  // For a host's perf log (racy reads, fine for that).
+  u64 NativeDispatches() const { return m_native_dispatches; }
+  u64 FallbackSteps() const { return m_fallback_steps; }
 
   // Gather-pipe and quantize hooks do not only fire from module code: anything
   // the module does not cover runs on m_fallback_jit, a real Jit64/JitArm64.

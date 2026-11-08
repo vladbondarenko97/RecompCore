@@ -18,6 +18,7 @@
 #define BACKEND_NULLSOUND _trans("No Audio Output")
 #define BACKEND_ALSA "ALSA"
 #define BACKEND_CUBEB "Cubeb"
+#define BACKEND_AUDIOUNIT "AudioUnit"
 #define BACKEND_OPENAL "OpenAL"
 #define BACKEND_PULSEAUDIO "Pulse"
 #define BACKEND_OPENSLES "OpenSLES"

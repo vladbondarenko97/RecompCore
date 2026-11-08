@@ -13,6 +13,11 @@ add_library(audiocommon
   WaveFile.h
 )
 
+if(IOS)
+  target_sources(audiocommon PRIVATE AudioUnitStream.cpp AudioUnitStream.h)
+  target_link_libraries(audiocommon PRIVATE "-framework AudioToolbox")
+endif()
+
 if(ENABLE_CUBEB)
   message(STATUS "Cubeb found, enabling Cubeb sound backend")
   target_sources(audiocommon PRIVATE

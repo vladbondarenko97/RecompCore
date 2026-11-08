@@ -246,7 +246,7 @@ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVt
 
 #if defined(_M_X86_64)
   native_loader = std::make_unique<VertexLoaderX64>(vtx_desc, vtx_attr);
-#elif defined(_M_ARM_64)
+#elif defined(_M_ARM_64) && !defined(IPHONEOS)  // no JIT on iOS: the software loader
   native_loader = std::make_unique<VertexLoaderARM64>(vtx_desc, vtx_attr);
 #endif
 

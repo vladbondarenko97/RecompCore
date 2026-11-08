@@ -3,7 +3,11 @@
 
 #include "Common/FilesystemWatcher.h"
 
+#ifdef IPHONEOS
+namespace wtr { inline namespace watcher { class watch {}; } }  // no FSEvents on iOS: watching is a no-op
+#else
 #include <wtr/watcher.hpp>
+#endif
 
 #include "Common/Logging/Log.h"
 #include "Common/StringUtil.h"
@@ -15,6 +19,9 @@ FilesystemWatcher::~FilesystemWatcher() = default;
 
 void FilesystemWatcher::Watch(const std::string& path)
 {
+#ifdef IPHONEOS
+  (void)path;
+#else
   const auto [iter, inserted] = m_watched_paths.try_emplace(path, nullptr);
   if (inserted)
   {
@@ -58,6 +65,7 @@ void FilesystemWatcher::Watch(const std::string& path)
       }
     });
   }
+#endif
 }
 
 void FilesystemWatcher::Unwatch(const std::string& path)

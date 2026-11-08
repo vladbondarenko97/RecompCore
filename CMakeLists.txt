@@ -661,7 +661,9 @@ if(ENABLE_VULKAN)
   endif()
 endif()
 
-if(NOT (WIN32 AND _M_ARM_64))
+if(IOS)
+  add_definitions(-DIPHONEOS=1)
+elseif(NOT (WIN32 AND _M_ARM_64))
   # OpenGL is available on all platforms except windows-arm64
   add_definitions(-DHAS_OPENGL)
 endif()
@@ -715,7 +717,7 @@ if(ENABLE_CUBEB)
   add_definitions(-DHAVE_CUBEB)
 endif()
 
-if(NOT ANDROID)
+if(NOT ANDROID AND NOT IOS)
   dolphin_find_optional_system_library(LibUSB Externals/libusb)
   add_definitions(-D__LIBUSB__)
 endif()
@@ -743,7 +745,7 @@ dolphin_find_optional_system_library(MBEDTLS Externals/mbedtls 2.28)
 
 dolphin_find_optional_system_library(CURL Externals/curl)
 
-if(NOT ANDROID)
+if(NOT ANDROID AND NOT IOS)
   dolphin_find_optional_system_library(HIDAPI Externals/hidapi)
 endif()
 

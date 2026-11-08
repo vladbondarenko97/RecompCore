@@ -84,7 +84,9 @@ if(NOT CHUNK_INPUTS)
   message(FATAL_ERROR "DolRecomp output has no generated chunks in ${GENERATED_DIR}/chunks")
 endif()
 
-add_library(${MODULE_NAME} SHARED
+# STATIC for iOS, where the module links into the app.
+set(RECOMPCORE_MODULE_LIBRARY_TYPE SHARED CACHE STRING "SHARED or STATIC")
+add_library(${MODULE_NAME} ${RECOMPCORE_MODULE_LIBRARY_TYPE}
   module_export.c
   "${MODULE_TABLES}"
   "${GXRUNTIME_DIR}/src/core/cpu.c"

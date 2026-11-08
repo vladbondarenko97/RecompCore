@@ -7,6 +7,7 @@
 #include <fmt/format.h>
 
 #include "AudioCommon/AlsaSoundStream.h"
+#include "AudioCommon/AudioUnitStream.h"
 #include "AudioCommon/CubebStream.h"
 #include "AudioCommon/Mixer.h"
 #include "AudioCommon/NullSoundStream.h"
@@ -30,6 +31,10 @@ constexpr int AUDIO_VOLUME_MAX = 100;
 
 static std::unique_ptr<SoundStream> CreateSoundStreamForBackend(std::string_view backend)
 {
+#ifdef IPHONEOS
+  if (backend == BACKEND_AUDIOUNIT)
+    return std::make_unique<AudioUnitStream>();
+#endif
   if (backend == BACKEND_CUBEB && CubebStream::IsValid())
     return std::make_unique<CubebStream>();
   else if (backend == BACKEND_OPENAL && OpenALStream::IsValid())
@@ -123,6 +128,9 @@ std::vector<std::string> GetSoundBackends()
   std::vector<std::string> backends;
 
   backends.emplace_back(BACKEND_NULLSOUND);
+#ifdef IPHONEOS
+  backends.emplace_back(BACKEND_AUDIOUNIT);
+#endif
   if (CubebStream::IsValid())
     backends.emplace_back(BACKEND_CUBEB);
   if (AlsaSound::IsValid())
