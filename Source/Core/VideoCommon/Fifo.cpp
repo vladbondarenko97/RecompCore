@@ -4,6 +4,7 @@
 #include "VideoCommon/Fifo.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 #include "Common/Assert.h"
@@ -383,6 +384,12 @@ void FifoManager::RunGpuLoop()
           // Make sure VertexManager finishes drawing any primitives it has stored in it's buffer.
           g_vertex_manager->Flush();
           g_framebuffer_manager->RefreshPeekCache();
+          // Sleep as soon as the FIFO is empty instead of spinning until the next 1 kHz
+          // GpuMaySleep: keeps the second core and the SoC cooler (+3-4 fps on a hot iPad Air 4).
+          // MODERNGEKKO_GPU_SPIN=1 restores Dolphin's spinning.
+          static const bool sleep_when_idle = std::getenv("MODERNGEKKO_GPU_SPIN") == nullptr;
+          if (sleep_when_idle)
+            m_gpu_mainloop.AllowSleep();
         }
       },
       100);

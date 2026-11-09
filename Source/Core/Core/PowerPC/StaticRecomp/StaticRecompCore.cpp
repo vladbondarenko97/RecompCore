@@ -418,6 +418,12 @@ void StaticRecompCore::ClearCache()
   ++m_reverify_events;
 }
 
+void StaticRecompHostCallsChanged()
+{
+  if (g_static_recomp_core)
+    g_static_recomp_core->HostCallsChanged();
+}
+
 void StaticRecompPerfCounters(u64* native, u64* fallback)
 {
   *native = g_static_recomp_core ? g_static_recomp_core->NativeDispatches() : 0;

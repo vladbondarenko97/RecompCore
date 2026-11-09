@@ -177,6 +177,13 @@ private:
   bool m_module_active = false;
   u32 m_host_call_passthrough_pc = 0;
   bool m_host_call_passthrough = false;
+  // A mod removed a patch (StaticRecompHostCallsChanged): recompute the host-call chunks.
+  bool m_host_calls_dirty = false;
+
+public:
+  void HostCallsChanged() { m_host_calls_dirty = true; }
+
+private:
   std::unique_ptr<JitBase> m_fallback_jit;
 
   u64 m_native_dispatches = 0;

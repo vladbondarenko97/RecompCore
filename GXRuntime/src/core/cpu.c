@@ -434,15 +434,18 @@ u64 gx_mem_read_slow(CPUState* cpu, u32 addr, u32 size) {
 }
 
 void gx_mem_write_slow(CPUState* cpu, u32 addr, u64 value, u32 size) {
-    /* GPU command writes: append to the gather pipe in place while it stays under 32 bytes;
-     * the write that fills it goes through the runtime, which writes and bursts. */
-    if ((addr & ~0xFFFu) == 0xCC008000u && cpu->gp_ptr && size <= 4) {
+    /* GPU command writes: append to the gather pipe in place (Dolphin's buffer holds 512 bytes)
+     * up to 256 bytes; the write past that goes through the runtime, which writes and bursts.
+     * The runtime bursts the complete 32-byte blocks after each dispatch and before any other
+     * hardware access, like Dolphin's JITs do at block ends. */
+    if ((addr & ~0xFFFu) == 0xCC008000u && cpu->gp_ptr) {
         u8* p = *cpu->gp_ptr;
-        if ((size_t)(p - *cpu->gp_base) + size < 32u) {
+        if ((size_t)(p - *cpu->gp_base) + size < 256u) {
             switch (size) {
             case 1: *p = (u8)value; break;
             case 2: write_be16(p, (u16)value); break;
-            default: write_be32(p, (u32)value); break;
+            case 4: write_be32(p, (u32)value); break;
+            default: write_be64(p, value); break;
             }
             *cpu->gp_ptr = p + size;
             return;

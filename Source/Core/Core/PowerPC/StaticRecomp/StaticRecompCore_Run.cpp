@@ -8,13 +8,39 @@
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/CPU.h"
+#include "Core/HW/GPFifo.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/ConfigManager.h"
 #include "Core/HW/SystemTimers.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+// STATICRECOMP_INTERP_STATS=1: log the guest PCs the dispatcher hands to the interpreter.
+static void CountInterpreterStep(u32 pc)
+{
+  static const bool enabled = std::getenv("STATICRECOMP_INTERP_STATS") != nullptr;
+  if (!enabled)
+    return;
+  static std::unordered_map<u32, u64> pcs;
+  static u64 total = 0;
+  ++pcs[pc];
+  if ((++total & ((1u << 22) - 1)) != 0)
+    return;
+  std::vector<std::pair<u64, u32>> top;
+  for (const auto& [a, n] : pcs)
+    top.emplace_back(n, a);
+  std::sort(top.rbegin(), top.rend());
+  std::fprintf(stderr, "[interp] total=%llu", static_cast<unsigned long long>(total));
+  for (size_t i = 0; i < top.size() && i < 24; ++i)
+    std::fprintf(stderr, " %08X:%llu", top[i].second, static_cast<unsigned long long>(top[i].first));
+  std::fprintf(stderr, "\n");
+}
 
 namespace
 {
@@ -163,6 +189,12 @@ void StaticRecompCore::Run()
   while (*state_ptr == CPU::State::Running)
   {
     core_timing.Advance();
+    if (m_host_calls_dirty)
+    {
+      m_host_calls_dirty = false;
+      std::fill(m_chunk_host_call_state.begin(), m_chunk_host_call_state.end(), u8{0});
+      ResetNativeOk();
+    }
     const std::string current_game_id = SConfig::GetInstance().GetGameID();
     m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);
 
@@ -205,6 +237,9 @@ void StaticRecompCore::Run()
           if (has_rel_modules)
             m_guest.pc = TranslateRelAddress(m_guest.pc);
           ++m_native_dispatches;
+          // Burst the GPU commands batched in the gather pipe (gx_mem_write_slow).
+          if (ppc.gather_pipe_ptr - ppc.gather_pipe_base_ptr >= GPFifo::GATHER_PIPE_SIZE)
+            m_system.GetGPFifo().UpdateGatherPipe();
 
           if (do_ls)
           {
@@ -236,6 +271,34 @@ void StaticRecompCore::Run()
           // ctx->timebase is refreshed at burst start (SyncIn), and here we
           // incrementally advance it by the exact block cycle charges to
           // prevent guest busy-wait loops from spinning on a stale timebase.
+          // The OS's syscall handler is only a write barrier (PPCSync: mfspr r9,HID0;
+          // ori r10,r9,8; mtspr HID0,r10; isync; sync; mtspr HID0,r9; rfi). Games call it
+          // ~25k times a second; run it here instead of leaving native code for 7 interpreter
+          // steps. Any other handler takes the normal path.
+          if (m_guest.exception == PPC_EXC_SYSTEM_CALL && (m_guest.pc & 0x000FFFFFu) == 0xC00u &&
+              m_guest.ram_size > 0xC1Cu)
+          {
+            static constexpr u32 kPPCSync[] = {0x7D30FAA6u, 0x612A0008u, 0x7D50FBA6u, 0x4C00012Cu,
+                                               0x7C0004ACu, 0x7D30FBA6u, 0x4C000064u};
+            bool match = true;
+            for (u32 i = 0; i < 7 && match; ++i)
+            {
+              const u8* w = m_guest.ram + 0xC00u + 4u * i;
+              match = (static_cast<u32>(w[0]) << 24 | static_cast<u32>(w[1]) << 16 |
+                       static_cast<u32>(w[2]) << 8 | w[3]) == kPPCSync[i];
+            }
+            if (match)
+            {
+              const u32 hid0 = ppc.spr[SPR_HID0];
+              m_guest.gpr[9] = hid0;
+              m_guest.gpr[10] = hid0 | 8u;
+              constexpr u32 mask = 0x87C0FFFFu;
+              m_guest.msr = ((m_guest.msr & ~mask) | (m_guest.srr1 & mask)) & 0xFFFBFFFFu;
+              m_guest.pc = m_guest.srr0;
+              m_guest.exception = 0;
+              ppc.downcount -= 7;
+            }
+          }
           if (m_guest.exception)
           {
             // DolRecomp's runtime already redirected pc/msr/srr to the guest
@@ -290,6 +353,7 @@ void StaticRecompCore::Run()
         // interrupts are delivered at slice start, as in Interpreter::Run.
         if (m_module_active && IsForcedFallbackAddress(ppc.pc))
         {
+          CountInterpreterStep(ppc.pc);
           ppc.downcount -= interpreter.SingleStepInner();
           ++m_fallback_steps;
         }
@@ -301,6 +365,7 @@ void StaticRecompCore::Run()
         {
           do
           {
+            CountInterpreterStep(ppc.pc);
             ppc.downcount -= interpreter.SingleStepInner();
             ++m_fallback_steps;
           } while (!(m_module_active && DispatchableAt(ppc.pc)) &&

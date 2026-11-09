@@ -182,6 +182,7 @@ u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
   if (ea == 0)
     std::fprintf(stderr, "[zero-access] read size=%u guest_pc=%08x ppc_pc=%08x lr=%08x\n", size,
                  cpu->pc, core->m_system.GetPPCState().pc, cpu->lr);
+  core->m_system.GetGPFifo().FastCheckGatherPipe();
   core->PropagateGuestMSR();
   auto& mmu = core->m_system.GetMMU();
   u64 value;
@@ -251,15 +252,14 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
       gpfifo.FastCheckGatherPipe();
       return;
     default:
-      for (u32 i = size * 8u; i > 0;)
-      {
-        i -= 8;
-        gpfifo.Write8(static_cast<u8>(value >> i));
-      }
+      gpfifo.FastWrite64(value);
+      gpfifo.FastCheckGatherPipe();
       return;
     }
   }
 
+  // Commands batched in the gather pipe reach the FIFO before any other hardware access.
+  core->m_system.GetGPFifo().FastCheckGatherPipe();
   core->PropagateGuestMSR();
   auto& mmu = core->m_system.GetMMU();
   if (core->m_lockstep_verifier->m_ls_journaling &&

@@ -106,15 +106,18 @@ static inline f64 f64_value(u64 bits) {
     return value;
 }
 
-static inline u64 convert_to_double(u32 value) {
+static inline __attribute__((always_inline)) u64 convert_to_double(u32 value) {
     u64 x = value;
     u64 exp = (x >> 23) & 0xFFu;
     u64 frac = x & 0x007FFFFFu;
 
-    if (exp > 0 && exp < 255) { /* normal */
-        u64 y = !(exp >> 7);
-        u64 z = (y << 61) | (y << 60) | (y << 59);
-        return ((x & 0xC0000000u) << 32) | z | ((x & 0x3FFFFFFFu) << 29);
+    if (__builtin_expect(exp > 0 && exp < 255, 1)) { /* normal: the hardware widening is exact */
+        f32 f;
+        memcpy(&f, &value, sizeof(f));
+        f64 d = (f64)f;
+        u64 bits;
+        memcpy(&bits, &d, sizeof(bits));
+        return bits;
     } else if (exp == 0 && frac != 0) { /* subnormal */
         exp = 1023 - 126;
         do {

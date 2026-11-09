@@ -3,6 +3,7 @@
 
 #include "VideoCommon/CommandProcessor.h"
 
+#include <algorithm>
 #include <atomic>
 #include <fmt/format.h>
 
@@ -382,6 +383,23 @@ void CommandProcessorManager::GatherPipeBursted()
   // If the game is running close to overflowing, make the exception checking more frequent.
   if (m_fifo.bFF_HiWatermark.load(std::memory_order_relaxed) != 0)
     m_system.GetCoreTiming().ForceExceptionCheck(0);
+
+  // Static recomp code runs long native stretches and takes the high-watermark
+  // interrupt late, so in dual core the CPU could wrap the FIFO over commands the
+  // GPU thread hasn't read yet (garbage opcodes, GPU hang). Past the watermark,
+  // wait for the GPU instead.
+  if (IsOnThread(m_system) && !m_system.GetFifo().UseDeterministicGPUThread())
+  {
+    const u32 size = m_fifo.CPEnd.load(std::memory_order_relaxed) -
+                     m_fifo.CPBase.load(std::memory_order_relaxed);
+    const u32 hi = m_fifo.CPHiWatermark ? m_fifo.CPHiWatermark : size;
+    if (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) + GPFifo::GATHER_PIPE_SIZE >=
+        std::min(hi, size))
+    {
+      m_system.GetFifo().RunGpu();  // wake it, then wait for it to drain
+      m_system.GetFifo().FlushGpu();
+    }
+  }
 
   m_fifo.CPReadWriteDistance.fetch_add(GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
 
