@@ -404,6 +404,12 @@ static inline bool ppc_fp_available_inline(CPUState* cpu, u32 cia) {
 }
 void ppc_fallback_instruction(CPUState* cpu, u32 raw, u32 cia);
 bool ppc_host_call(CPUState* cpu, u32 address);
+/* DolRecomp's native-region query: true if [start, end) may run natively
+   without going through the chassis (cross-chunk direct calls). */
+#define PPC_HOST_CALL_NATIVE_REGION_QUERY 0xFFFFFFFCu
+#define PPC_NATIVE_REGION_QUERY_PENDING 0xFEu
+#define PPC_NATIVE_REGION_QUERY_HANDLED 0xFFu
+bool ppc_native_region_available(CPUState* cpu, u32 start, u32 end);
 void ppc_system_call_exception(CPUState* cpu, u32 cia);
 void ppc_dsi_exception(CPUState* cpu, u32 ea, u32 cia, u32 dsisr);
 void ppc_alignment_exception(CPUState* cpu, u32 ea, u32 cia);

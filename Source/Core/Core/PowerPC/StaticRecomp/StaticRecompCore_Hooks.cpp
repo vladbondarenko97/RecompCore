@@ -19,9 +19,33 @@ namespace
 constexpr u32 LOCKED_CACHE_BASE = 0xE0000000u;
 }
 
+// DolRecomp cpu.h's native-region query protocol (GXRuntime's header lacks it).
+#ifndef PPC_HOST_CALL_NATIVE_REGION_QUERY
+#define PPC_HOST_CALL_NATIVE_REGION_QUERY 0xFFFFFFFCu
+#define PPC_NATIVE_REGION_QUERY_PENDING 0xFEu
+#define PPC_NATIVE_REGION_QUERY_HANDLED 0xFFu
+#endif
+
 bool StaticRecompCore::HookHostCall(CPUState* cpu, u32 address)
 {
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
+  // Generated code asks before calling another chunk directly: answer what
+  // the dispatch loop would check for that target.
+  if (address == PPC_HOST_CALL_NATIVE_REGION_QUERY &&
+      cpu->external_rid == PPC_NATIVE_REGION_QUERY_PENDING)
+  {
+    cpu->external_rid = PPC_NATIVE_REGION_QUERY_HANDLED;
+    const u32 target = cpu->external_addr;
+    // The call has set lr to its return address: returning to an idle loop
+    // must go through the chassis, which only idles when it sees that pc.
+    if (core->m_idle_pc != 0 && cpu->lr == core->m_idle_pc)
+      return true;
+    if (core->m_has_rel_modules || !core->m_module_active || !core->FastDispatchableAt(target) ||
+        core->IsHostCallAddress(target))
+      return true;
+    const int index = core->ChunkIndexOf(target);
+    return index < 0 || core->ChunkContainsHostCall(static_cast<u32>(index));
+  }
   return core->m_module_source.host_call &&
          core->m_module_source.host_call(cpu, address, core->m_module_source.host_call_user);
 }
