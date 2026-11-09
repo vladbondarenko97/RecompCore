@@ -163,17 +163,53 @@ struct CPUState {
     PPCSPRRead spr_read;
     PPCSPRWrite spr_write;
     PPCCacheControl cache_control;
+    struct GXVTlbEntry* vtlb;  /* 2 * GX_VTLB_SIZE entries (reads, then writes), or NULL */
+    u32 vtlb_epoch;            /* bumped on tlbie / SDR1 / BAT changes / state loads */
+    /* Gather pipe (0xCC008000) fast path: Dolphin's PowerPCState gather_pipe_ptr/base_ptr. */
+    u8** gp_ptr;
+    u8** gp_base;
+    /* Cross-chunk call check cache: one byte per 16 KiB chunk slot from native_base, set by the
+     * runtime once a chunk may be entered natively (verified, no mod hook), cleared on any change. */
+    const u8* native_ok;
+    u32 native_base;
+    u32 native_slots;
+    u32 native_idle_pc;
 };
+
+/* Software TLB for page-table-translated guest addresses (games that keep part of their heap
+ * in virtual memory: The Sims 2 Pets uses 0x7E000000+). The runtime fills an entry after a real
+ * MMU access, so the PTE's R (and for writes C) bit is already set; entries are keyed by page,
+ * segment register value and vtlb_epoch, with separate read and write entries. */
+typedef struct GXVTlbEntry {
+    u32 vpage;
+    u32 sr;
+    u32 epoch;
+    u32 pad;
+    u8* host;
+} GXVTlbEntry;
+#define GX_VTLB_SIZE 1024u
 
 #include <stdio.h>
 
 typedef void (*PPCMemWriteJournal)(u32 offset, u32 size, void* user);
 extern PPCMemWriteJournal g_mem_write_journal;
 extern void* g_mem_write_journal_user;
+#ifdef GXRUNTIME_GC_FAST_MEM
+#define GXRUNTIME_MEM_JOURNAL 0
+#else
+#define GXRUNTIME_MEM_JOURNAL 1
+#endif
+
+#ifdef GXRUNTIME_GC_FAST_MEM
+#define GX_RAM_SIZE(cpu) 0x01800000u
+#else
+#define GX_RAM_SIZE(cpu) ((cpu)->ram_size)
+#endif
 
 static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size, u32* out_offset) {
     u32 masked_addr = addr & ~0x40000000u;
     
+#ifndef GXRUNTIME_GC_FAST_MEM
     // Check MEM2 (EXRAM) first as it is much more common in Wii titles
     if (cpu->exram) {
         u32 offset = masked_addr - 0x90000000u;
@@ -182,10 +218,11 @@ static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size
             return cpu->exram + offset;
         }
     }
+#endif
     
-    // Check MEM1
+    // Check MEM1 (GameCube MEM1 is a fixed 24 MiB: a constant saves a load per access)
     u32 offset = masked_addr - 0x80000000u;
-    if (offset <= cpu->ram_size - size) {
+    if (offset <= GX_RAM_SIZE(cpu) - size) {
         if (out_offset) *out_offset = offset;
         return cpu->ram + offset;
     }
@@ -193,20 +230,46 @@ static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size
     return NULL;
 }
 
+static GXRUNTIME_ALWAYS_INLINE u8* gx_vtlb_ptr(CPUState* cpu, u32 addr, u32 size, u32 write) {
+#ifdef GXRUNTIME_GC_FAST_MEM
+    const GXVTlbEntry* e;
+    if (!cpu->vtlb)
+        return NULL;
+    e = &cpu->vtlb[((addr >> 12) & (GX_VTLB_SIZE - 1u)) + (write ? GX_VTLB_SIZE : 0u)];
+    if (e->host && e->vpage == (addr >> 12) && e->sr == cpu->sr[addr >> 28] &&
+        e->epoch == cpu->vtlb_epoch && (cpu->msr & PPC_MSR_DR) && (addr & 0xFFFu) <= 0x1000u - size)
+        return e->host + (addr & 0xFFFu);
+#else
+    (void)cpu; (void)addr; (void)size; (void)write;
+#endif
+    return NULL;
+}
+
+/* GXRUNTIME_NO_RESERVATION: for games with no lwarx/stwcx. (The Sims 2 Pets has none) the
+ * reservation is never set, so stores skip the check. */
 static GXRUNTIME_ALWAYS_INLINE void clear_matching_reservation(CPUState* cpu, u32 addr) {
+#ifdef GXRUNTIME_NO_RESERVATION
+    (void)cpu; (void)addr;
+    return;
+#endif
     u32 reserve_addr = cpu->reserve_addr & ~0x40000000u;
     u32 store_addr = addr & ~0x40000000u;
     if (cpu->reserve_valid && ((reserve_addr ^ store_addr) & ~31u) == 0)
         cpu->reserve_valid = false;
 }
 
+/* Out-of-line slow paths of the mem_read and mem_write helpers (software TLB, then the runtime's external
+ * access): keeps the ~300k inlined access sites in generated code small. */
+u64 gx_mem_read_slow(CPUState* cpu, u32 addr, u32 size);
+void gx_mem_write_slow(CPUState* cpu, u32 addr, u64 value, u32 size);
+/* lmw/stmw when the span is not plain RAM (DolRecomp emits a one-check fast path). */
+void gx_lmw_slow(CPUState* cpu, u32 ea, u32 first);
+void gx_stmw_slow(CPUState* cpu, u32 ea, u32 first);
+
 static GXRUNTIME_ALWAYS_INLINE u64 mem_read64(CPUState* cpu, u32 addr) {
     u8* ptr = get_ram_ptr(cpu, addr, 8, NULL);
-    if (ptr == NULL) {
-        if (cpu->external_read)
-            return cpu->external_read(cpu, addr, 8);
-        return 0;
-    }
+    if (ptr == NULL)
+        return (u64)gx_mem_read_slow(cpu, addr, 8);
     return read_be64(ptr);
 }
 
@@ -214,23 +277,18 @@ static GXRUNTIME_ALWAYS_INLINE void mem_write64(CPUState* cpu, u32 addr, u64 val
     u32 offset;
     u8* ptr = get_ram_ptr(cpu, addr, 8, &offset);
     if (ptr == NULL) {
-        if (cpu->external_write) {
-            cpu->external_write(cpu, addr, value, 8);
-        }
+        gx_mem_write_slow(cpu, addr, value, 8);
         return;
     }
     clear_matching_reservation(cpu, addr);
-    if (g_mem_write_journal && offset != (u32)-1) g_mem_write_journal(offset, 8, g_mem_write_journal_user);
+    if (GXRUNTIME_MEM_JOURNAL && g_mem_write_journal && offset != (u32)-1) g_mem_write_journal(offset, 8, g_mem_write_journal_user);
     write_be64(ptr, value);
 }
 
 static GXRUNTIME_ALWAYS_INLINE u32 mem_read32(CPUState* cpu, u32 addr) {
     u8* ptr = get_ram_ptr(cpu, addr, 4, NULL);
-    if (ptr == NULL) {
-        if (cpu->external_read)
-            return (u32)cpu->external_read(cpu, addr, 4);
-        return 0;
-    }
+    if (ptr == NULL)
+        return (u32)gx_mem_read_slow(cpu, addr, 4);
     return read_be32(ptr);
 }
 
@@ -238,23 +296,61 @@ static GXRUNTIME_ALWAYS_INLINE void mem_write32(CPUState* cpu, u32 addr, u32 val
     u32 offset;
     u8* ptr = get_ram_ptr(cpu, addr, 4, &offset);
     if (ptr == NULL) {
-        if (cpu->external_write) {
-            cpu->external_write(cpu, addr, value, 4);
-        }
+        gx_mem_write_slow(cpu, addr, value, 4);
         return;
     }
     clear_matching_reservation(cpu, addr);
-    if (g_mem_write_journal && offset != (u32)-1) g_mem_write_journal(offset, 4, g_mem_write_journal_user);
+    if (GXRUNTIME_MEM_JOURNAL && g_mem_write_journal && offset != (u32)-1) g_mem_write_journal(offset, 4, g_mem_write_journal_user);
     write_be32(ptr, value);
 }
 
+#ifdef GXRUNTIME_GC_FAST_MEM
+/* Variants taking the RAM base as an argument: DolRecomp's generated code keeps it in a local
+ * (dolrecomp_ram), which survives the slow-path calls, instead of reloading cpu->ram. */
+#define GX_RB_OFFSET(addr) (((addr) & ~0x40000000u) - 0x80000000u)
+#define GX_RB_IN_RAM(off, size) __builtin_expect((off) <= 0x01800000u - (size), 1)
+static GXRUNTIME_ALWAYS_INLINE u8 gx_rb_read8(CPUState* cpu, u8* base, u32 addr) {
+    u32 off = GX_RB_OFFSET(addr);
+    if (GX_RB_IN_RAM(off, 1u)) return base[off];
+    return (u8)gx_mem_read_slow(cpu, addr, 1);
+}
+static GXRUNTIME_ALWAYS_INLINE u16 gx_rb_read16(CPUState* cpu, u8* base, u32 addr) {
+    u32 off = GX_RB_OFFSET(addr);
+    if (GX_RB_IN_RAM(off, 2u)) return read_be16(base + off);
+    return (u16)gx_mem_read_slow(cpu, addr, 2);
+}
+static GXRUNTIME_ALWAYS_INLINE u32 gx_rb_read32(CPUState* cpu, u8* base, u32 addr) {
+    u32 off = GX_RB_OFFSET(addr);
+    if (GX_RB_IN_RAM(off, 4u)) return read_be32(base + off);
+    return (u32)gx_mem_read_slow(cpu, addr, 4);
+}
+static GXRUNTIME_ALWAYS_INLINE u64 gx_rb_read64(CPUState* cpu, u8* base, u32 addr) {
+    u32 off = GX_RB_OFFSET(addr);
+    if (GX_RB_IN_RAM(off, 8u)) return read_be64(base + off);
+    return gx_mem_read_slow(cpu, addr, 8);
+}
+#define GX_RB_WRITE(name, T, N, store)                                                    \
+    static GXRUNTIME_ALWAYS_INLINE void name(CPUState* cpu, u8* base, u32 addr, T value) { \
+        u32 off = GX_RB_OFFSET(addr);                                                     \
+        if (GX_RB_IN_RAM(off, N)) {                                                       \
+            u8* p = base + off;                                                           \
+            clear_matching_reservation(cpu, addr);                                        \
+            store;                                                                        \
+            return;                                                                       \
+        }                                                                                 \
+        gx_mem_write_slow(cpu, addr, value, N);                                           \
+    }
+GX_RB_WRITE(gx_rb_write8, u8, 1u, *p = value)
+GX_RB_WRITE(gx_rb_write16, u16, 2u, write_be16(p, value))
+GX_RB_WRITE(gx_rb_write32, u32, 4u, write_be32(p, value))
+GX_RB_WRITE(gx_rb_write64, u64, 8u, write_be64(p, value))
+#undef GX_RB_WRITE
+#endif
+
 static GXRUNTIME_ALWAYS_INLINE u16 mem_read16(CPUState* cpu, u32 addr) {
     u8* ptr = get_ram_ptr(cpu, addr, 2, NULL);
-    if (ptr == NULL) {
-        if (cpu->external_read)
-            return (u16)cpu->external_read(cpu, addr, 2);
-        return 0;
-    }
+    if (ptr == NULL)
+        return (u16)gx_mem_read_slow(cpu, addr, 2);
     return read_be16(ptr);
 }
 
@@ -262,23 +358,18 @@ static GXRUNTIME_ALWAYS_INLINE void mem_write16(CPUState* cpu, u32 addr, u16 val
     u32 offset;
     u8* ptr = get_ram_ptr(cpu, addr, 2, &offset);
     if (ptr == NULL) {
-        if (cpu->external_write) {
-            cpu->external_write(cpu, addr, value, 2);
-        }
+        gx_mem_write_slow(cpu, addr, value, 2);
         return;
     }
     clear_matching_reservation(cpu, addr);
-    if (g_mem_write_journal && offset != (u32)-1) g_mem_write_journal(offset, 2, g_mem_write_journal_user);
+    if (GXRUNTIME_MEM_JOURNAL && g_mem_write_journal && offset != (u32)-1) g_mem_write_journal(offset, 2, g_mem_write_journal_user);
     write_be16(ptr, value);
 }
 
 static GXRUNTIME_ALWAYS_INLINE u8 mem_read8(CPUState* cpu, u32 addr) {
     u8* ptr = get_ram_ptr(cpu, addr, 1, NULL);
-    if (ptr == NULL) {
-        if (cpu->external_read)
-            return (u8)cpu->external_read(cpu, addr, 1);
-        return 0;
-    }
+    if (ptr == NULL)
+        return (u8)gx_mem_read_slow(cpu, addr, 1);
     return *ptr;
 }
 
@@ -286,13 +377,11 @@ static GXRUNTIME_ALWAYS_INLINE void mem_write8(CPUState* cpu, u32 addr, u8 value
     u32 offset;
     u8* ptr = get_ram_ptr(cpu, addr, 1, &offset);
     if (ptr == NULL) {
-        if (cpu->external_write) {
-            cpu->external_write(cpu, addr, value, 1);
-        }
+        gx_mem_write_slow(cpu, addr, value, 1);
         return;
     }
     clear_matching_reservation(cpu, addr);
-    if (g_mem_write_journal && offset != (u32)-1) g_mem_write_journal(offset, 1, g_mem_write_journal_user);
+    if (GXRUNTIME_MEM_JOURNAL && g_mem_write_journal && offset != (u32)-1) g_mem_write_journal(offset, 1, g_mem_write_journal_user);
     *ptr = value;
 }
 
@@ -409,7 +498,18 @@ bool ppc_host_call(CPUState* cpu, u32 address);
 #define PPC_HOST_CALL_NATIVE_REGION_QUERY 0xFFFFFFFCu
 #define PPC_NATIVE_REGION_QUERY_PENDING 0xFEu
 #define PPC_NATIVE_REGION_QUERY_HANDLED 0xFFu
-bool ppc_native_region_available(CPUState* cpu, u32 start, u32 end);
+bool ppc_native_region_available_slow(CPUState* cpu, u32 start, u32 end);
+static inline bool ppc_native_region_available(CPUState* cpu, u32 start, u32 end) {
+    const u8* ok = cpu->native_ok;
+    if (ok) {
+        u32 target = (start - cpu->native_base) >> 14;
+        u32 caller = (cpu->lr - cpu->native_base) >> 14;
+        if (target < cpu->native_slots && caller < cpu->native_slots && ok[target] && ok[caller] &&
+            cpu->lr != cpu->native_idle_pc)
+            return true;
+    }
+    return ppc_native_region_available_slow(cpu, start, end);
+}
 void ppc_system_call_exception(CPUState* cpu, u32 cia);
 void ppc_dsi_exception(CPUState* cpu, u32 ea, u32 cia, u32 dsisr);
 void ppc_alignment_exception(CPUState* cpu, u32 ea, u32 cia);
@@ -418,6 +518,13 @@ void ppc_rfi(CPUState* cpu, u32 cia);
 void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia);
 bool ppc_psq_load(CPUState* cpu, u8 frD, u32 ea, bool w, u8 gqr, bool indexed, u32 cia);
 bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr, bool indexed, u32 cia);
+
+/* Forced inline: at -O2 the compiler otherwise leaves ~2000 call sites out of line. */
+#if defined(__GNUC__) || defined(__clang__)
+#define GXRUNTIME_PSQ_INLINE static inline __attribute__((always_inline))
+#else
+#define GXRUNTIME_PSQ_INLINE static inline
+#endif
 
 /* Inlined fast path for the unquantised case. A `sample` of a Mario Kart race
  * put psq_load_value and psq_store_value at ~9% of self time inside
@@ -431,7 +538,7 @@ bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr, bool indexed, 
  * The win is bigger than skipping a call: at every generated site w, gqr_index,
  * indexed and cia are literals, so inlining lets the compiler fold the LSQE
  * test and the w branch away per site, which it cannot do across a call. */
-static inline bool ppc_psq_load_inline(CPUState* cpu, u8 frD, u32 ea, bool w,
+GXRUNTIME_PSQ_INLINE bool ppc_psq_load_inline(CPUState* cpu, u8 frD, u32 ea, bool w,
                                        u8 gqr_index, bool indexed, u32 cia) {
     const u32 gqr = cpu->gqr[gqr_index & 7u];
     if (((gqr >> 16) & 7u) == 0u && (indexed || (cpu->hid2 & PPC_HID2_LSQE) != 0u)) {
@@ -442,7 +549,7 @@ static inline bool ppc_psq_load_inline(CPUState* cpu, u8 frD, u32 ea, bool w,
     return ppc_psq_load(cpu, frD, ea, w, gqr_index, indexed, cia);
 }
 
-static inline bool ppc_psq_store_inline(CPUState* cpu, u8 frS, u32 ea, bool w,
+GXRUNTIME_PSQ_INLINE bool ppc_psq_store_inline(CPUState* cpu, u8 frS, u32 ea, bool w,
                                         u8 gqr_index, bool indexed, u32 cia) {
     const u32 gqr = cpu->gqr[gqr_index & 7u];
     if ((gqr & 7u) == 0u && (indexed || (cpu->hid2 & PPC_HID2_LSQE) != 0u)) {
@@ -462,5 +569,8 @@ void ppc_memory_fence(void);
 #ifdef __cplusplus
 }
 #endif
+
+/* Header-only fast paths of the FP / paired-single helpers declared above. */
+#include "cpu_float_inline.h"
 
 #endif /* DOLRECOMP_CPU_H */

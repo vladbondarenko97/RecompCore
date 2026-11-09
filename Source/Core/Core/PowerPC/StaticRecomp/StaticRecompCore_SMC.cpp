@@ -95,6 +95,7 @@ void StaticRecompCore::RefreshRelSections()
       continue;
     if (m_chunk_state[i] == CHUNK_FAILED && m_failed_chunks != 0)
       --m_failed_chunks;
+    ResetNativeOk();
     m_chunk_state[i] = CHUNK_UNVERIFIED;
     m_effective_chunk_hashes[i] = m_module->chunk_hashes[i];
   }
@@ -151,7 +152,7 @@ bool StaticRecompCore::ResolveRuntimeAddress(u32 linked_address, u32* runtime_ad
   return true;
 }
 
-u32 StaticRecompCore::TranslateRelAddress(u32 linked_address)
+u32 StaticRecompCore::TranslateRelAddressSlow(u32 linked_address)
 {
   u32 runtime_address = linked_address;
   ResolveRuntimeAddress(linked_address, &runtime_address);
@@ -206,7 +207,9 @@ int StaticRecompCore::ChunkIndexOf(u32 address)
     return -1;
 
   u32 linked_address = address;
-  if (!ResolveNativeAddress(address, &linked_address, nullptr))
+  // Without REL modules ResolveNativeAddress reduces to the lookup below
+  // (no active sections, every chunk maps to itself).
+  if (m_has_rel_modules && !ResolveNativeAddress(address, &linked_address, nullptr))
     return -1;
   int idx = GetAddressLookupIndex(linked_address);
   if (idx < 0 || idx >= static_cast<int>(m_chunk_lookup_table.size()))
@@ -292,6 +295,7 @@ void StaticRecompCore::VerifyChunk(u32 index)
 
   if (runtime_start < 0x80000000u || offset >= ram_size || length > ram_size - offset)
   {
+    ResetNativeOk();
     m_chunk_state[index] = CHUNK_FAILED;
     ++m_failed_chunks;
     ERROR_LOG_FMT(POWERPC, "StaticRecomp: chunk [0x{:08X},0x{:08X}) outside guest RAM",
@@ -317,6 +321,7 @@ void StaticRecompCore::VerifyChunk(u32 index)
   }
   else
   {
+    ResetNativeOk();
     m_chunk_state[index] = CHUNK_FAILED;
     ++m_failed_chunks;
     std::fprintf(stderr,
@@ -366,7 +371,8 @@ void StaticRecompCore::OnICacheInvalidate(u32 address, u32 length)
     {
       if (m_chunk_state[i] == CHUNK_FAILED)
         --m_failed_chunks;
-      m_chunk_state[i] = CHUNK_UNVERIFIED;
+      ResetNativeOk();
+    m_chunk_state[i] = CHUNK_UNVERIFIED;
       ++m_reverify_events;
     }
   }

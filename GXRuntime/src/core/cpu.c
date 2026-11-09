@@ -141,7 +141,7 @@ bool ppc_host_call(CPUState* cpu, u32 address) {
     return cpu->host_call ? cpu->host_call(cpu, address) : false;
 }
 
-bool ppc_native_region_available(CPUState* cpu, u32 start, u32 end) {
+bool ppc_native_region_available_slow(CPUState* cpu, u32 start, u32 end) {
     if (!cpu || !cpu->host_call)
         return true;
 
@@ -399,6 +399,14 @@ void ppc_tlbie(CPUState* cpu, u32 ea, u32 cia) {
     cpu->tlb_last_vps = (ea >> 12) & 0xFFFFu;
     cpu->tlb_last_index = (ea >> 12) & 0x3Fu;
     cpu->tlb_invalidate_count++;
+    /* Like the Gekko TLB, drop only the congruence class (EA bits 12-17), not the whole
+     * software TLB: the game's virtual memory issues tlbie for every page it swaps. */
+    if (cpu->vtlb) {
+        for (u32 i = (ea >> 12) & 0x3Fu; i < GX_VTLB_SIZE; i += 0x40u) {
+            cpu->vtlb[i].host = NULL;
+            cpu->vtlb[i + GX_VTLB_SIZE].host = NULL;
+        }
+    }
 }
 
 bool ppc_trap_condition(u8 to, u32 a, u32 b) {
@@ -410,4 +418,56 @@ bool ppc_trap_condition(u8 to, u32 a, u32 b) {
            ((sa == sb) && (to & 0x04u)) ||
            ((a < b) && (to & 0x02u)) ||
            ((a > b) && (to & 0x01u));
+}
+
+u64 gx_mem_read_slow(CPUState* cpu, u32 addr, u32 size) {
+    u8* ptr = gx_vtlb_ptr(cpu, addr, size, 0);
+    if (ptr) {
+        switch (size) {
+        case 1: return *ptr;
+        case 2: return read_be16(ptr);
+        case 4: return read_be32(ptr);
+        default: return read_be64(ptr);
+        }
+    }
+    return cpu->external_read ? cpu->external_read(cpu, addr, (u8)size) : 0;
+}
+
+void gx_mem_write_slow(CPUState* cpu, u32 addr, u64 value, u32 size) {
+    /* GPU command writes: append to the gather pipe in place while it stays under 32 bytes;
+     * the write that fills it goes through the runtime, which writes and bursts. */
+    if ((addr & ~0xFFFu) == 0xCC008000u && cpu->gp_ptr && size <= 4) {
+        u8* p = *cpu->gp_ptr;
+        if ((size_t)(p - *cpu->gp_base) + size < 32u) {
+            switch (size) {
+            case 1: *p = (u8)value; break;
+            case 2: write_be16(p, (u16)value); break;
+            default: write_be32(p, (u32)value); break;
+            }
+            *cpu->gp_ptr = p + size;
+            return;
+        }
+    }
+    u8* ptr = gx_vtlb_ptr(cpu, addr, size, 1);
+    if (ptr) {
+        clear_matching_reservation(cpu, addr);
+        switch (size) {
+        case 1: *ptr = (u8)value; return;
+        case 2: write_be16(ptr, (u16)value); return;
+        case 4: write_be32(ptr, (u32)value); return;
+        default: write_be64(ptr, value); return;
+        }
+    }
+    if (cpu->external_write)
+        cpu->external_write(cpu, addr, value, (u8)size);
+}
+
+void gx_lmw_slow(CPUState* cpu, u32 ea, u32 first) {
+    for (u32 r = first; r < 32; r++, ea += 4)
+        cpu->gpr[r] = mem_read32(cpu, ea);
+}
+
+void gx_stmw_slow(CPUState* cpu, u32 ea, u32 first) {
+    for (u32 r = first; r < 32; r++, ea += 4)
+        mem_write32(cpu, ea, cpu->gpr[r]);
 }

@@ -63,9 +63,51 @@ void StaticRecompCore::Run()
   m_guest.exram = memory.GetEXRAM();
   m_guest.exram_size = memory.GetExRamSizeReal();
   InitLookupTable(m_guest.ram_size, m_guest.exram_size);
+  // Software TLB for virtual-memory pages (flushed in ClearCache, e.g. on a state load).
+  // Cross-chunk call cache (GXRuntime ppc_native_region_available): only for the plain layout.
+  if (m_module && m_module_active && !m_has_rel_modules && m_forced_fallback_ranges.empty() &&
+      m_chunk_slot.empty())
+  {
+    const u32 n = m_module->num_chunk_ranges;
+    u32 base = 0;
+    for (u32 i = 0; i < n && base == 0; ++i)
+      if (m_module->chunk_ranges[i].end - m_module->chunk_ranges[i].start == 0x4000u)
+        base = m_module->chunk_ranges[i].start;
+    m_chunk_slot.assign(n, -1);
+    u32 slots = 0;
+    for (u32 i = 0; i < n && base != 0; ++i)
+    {
+      const auto& c = m_module->chunk_ranges[i];
+      if (c.start >= base && c.end - c.start == 0x4000u && ((c.start - base) & 0x3FFFu) == 0)
+      {
+        m_chunk_slot[i] = static_cast<int>((c.start - base) >> 14);
+        slots = std::max(slots, static_cast<u32>(m_chunk_slot[i]) + 1);
+      }
+    }
+    m_native_ok.assign(slots, 0);
+    m_guest.native_ok = slots ? m_native_ok.data() : nullptr;
+    m_guest.native_base = base;
+    m_guest.native_slots = slots;
+  }
+  m_guest.native_idle_pc = m_idle_pc;
+  // Gather pipe fast path in GXRuntime gx_mem_write_slow (not while lockstep journals MMIO).
+  if (!m_lockstep_verifier->IsEnabled())
+  {
+    m_guest.gp_ptr = &ppc.gather_pipe_ptr;
+    m_guest.gp_base = &ppc.gather_pipe_base_ptr;
+  }
+  if (m_vtlb.empty())
+  {
+    m_vtlb.assign(2 * GX_VTLB_SIZE, GXVTlbEntry{});
+    m_guest.vtlb = m_vtlb.data();
+  }
   const bool lockstep_enabled = m_lockstep_verifier->IsEnabled();
-  const auto fast_dispatchable_at = [this](u32 address) {
-    if (m_has_rel_modules || !m_forced_fallback_ranges.empty())
+  // Loop-invariant for the whole Run(): set in Init()/LoadModule().
+  const bool has_rel_modules = m_has_rel_modules;
+  const bool diag_per_dispatch = dispatch_trace || m_collect_dispatch_samples;
+  const u32 idle_pc = m_idle_pc;
+  const auto fast_dispatchable_at = [this, has_rel_modules](u32 address) {
+    if (has_rel_modules)
       return FastDispatchableAt(address);
     if (!m_module_active || m_chunk_lookup_table.empty())
       return false;
@@ -82,7 +124,8 @@ void StaticRecompCore::Run()
     if (lookup_index < 0 || lookup_index >= static_cast<int>(m_chunk_lookup_table.size()))
       return false;
     const int chunk = m_chunk_lookup_table[lookup_index];
-    return chunk >= 0 && m_chunk_state[chunk] == CHUNK_VERIFIED;
+    return chunk >= 0 && m_chunk_state[chunk] == CHUNK_VERIFIED &&
+           !IsForcedFallbackAddress(address);
   };
 
   const std::string initial_game_id = SConfig::GetInstance().GetGameID();
@@ -134,13 +177,18 @@ void StaticRecompCore::Run()
         ++m_bursts;
         do
         {
-          if (dispatch_trace && (m_native_dispatches & 0xFFFFFu) == 0)
+          if (diag_per_dispatch)
           {
-            std::fprintf(dispatch_trace.get(), "%llu,%08x,%08x,%08x,%08x,%llu,%d\n",
-                         static_cast<unsigned long long>(m_native_dispatches), m_guest.pc,
-                         m_guest.lr, m_guest.ctr, m_guest.cr,
-                         static_cast<unsigned long long>(m_guest.timebase), ppc.downcount);
-            std::fflush(dispatch_trace.get());
+            if (dispatch_trace && (m_native_dispatches & 0xFFFFFu) == 0)
+            {
+              std::fprintf(dispatch_trace.get(), "%llu,%08x,%08x,%08x,%08x,%llu,%d\n",
+                           static_cast<unsigned long long>(m_native_dispatches), m_guest.pc,
+                           m_guest.lr, m_guest.ctr, m_guest.cr,
+                           static_cast<unsigned long long>(m_guest.timebase), ppc.downcount);
+              std::fflush(dispatch_trace.get());
+            }
+            if (m_collect_dispatch_samples && (m_native_dispatches & 4095u) == 0)
+              ++m_dispatch_samples[m_guest.pc];
           }
           const bool do_ls = lockstep_enabled && m_lockstep_verifier->ShouldCheck(m_guest.pc);
           if (do_ls)
@@ -148,15 +196,13 @@ void StaticRecompCore::Run()
             m_lockstep_verifier->Prepare(m_guest);
           }
 
-          if (m_collect_dispatch_samples && (m_native_dispatches & 4095u) == 0)
-            ++m_dispatch_samples[m_guest.pc];
           const u32 runtime_dispatch_address = m_guest.pc;
           u32 linked_dispatch_address = runtime_dispatch_address;
-          if (m_has_rel_modules)
+          if (has_rel_modules)
             ResolveNativeAddress(runtime_dispatch_address, &linked_dispatch_address, nullptr);
           m_guest.pc = linked_dispatch_address;
           m_module->dispatch(&m_guest, linked_dispatch_address);
-          if (m_has_rel_modules)
+          if (has_rel_modules)
             m_guest.pc = TranslateRelAddress(m_guest.pc);
           ++m_native_dispatches;
 
@@ -182,7 +228,7 @@ void StaticRecompCore::Run()
           m_timebase_cycle_remainder = total_cycles % SystemTimers::TIMER_RATIO;
 
           // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
-          if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
+          if (idle_pc != 0 && m_guest.pc == idle_pc)
           {
             m_system.GetCoreTiming().Idle();
           }

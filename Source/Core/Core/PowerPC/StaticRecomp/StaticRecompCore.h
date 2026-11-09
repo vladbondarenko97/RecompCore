@@ -55,6 +55,7 @@ public:
   bool FastDispatchableAt(u32 address);
   bool IsHostCallAddress(u32 address) const;
   bool ShouldYieldAt(u32 address);
+  const CPUState& Guest() const { return m_guest; }
 
   void ClearCache() override;
   void Jit(u32 em_address) override {}
@@ -131,7 +132,12 @@ private:
   void VerifyChunk(u32 index);
   bool ResolveNativeAddress(u32 runtime_address, u32* linked_address, u32* rel_section_index);
   bool ResolveRuntimeAddress(u32 linked_address, u32* runtime_address) const;
-  u32 TranslateRelAddress(u32 linked_address);
+  u32 TranslateRelAddress(u32 linked_address)
+  {
+    // Without REL modules m_active_rel_sections is always empty: identity.
+    return m_has_rel_modules ? TranslateRelAddressSlow(linked_address) : linked_address;
+  }
+  u32 TranslateRelAddressSlow(u32 linked_address);
   void RefreshRelSections();
 
   static void SetPPCStateFromGuestState(const CPUState& s, PowerPC::PowerPCState& ppc);
@@ -151,6 +157,7 @@ private:
   static void* HookExternalPointer(CPUState* cpu, u32 ea, u32 size);
   static u32 HookSPRRead(CPUState* cpu, u16 spr, u32 cia);
   static void HookSPRWrite(CPUState* cpu, u16 spr, u32 value, u32 cia);
+  static void FillVtlb(StaticRecompCore* core, CPUState* cpu, u32 ea, bool write);
   static void HookCacheControl(CPUState* cpu, u8 operation, u32 ea, u32 cia);
   static void HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia);
   static bool HookHostCall(CPUState* cpu, u32 address);
@@ -183,6 +190,14 @@ private:
 
   // D4 guard state: parallel to m_module->chunk_ranges.
   std::vector<u8> m_chunk_state;
+  std::vector<GXVTlbEntry> m_vtlb;  // the guest code's software TLB (m_guest.vtlb)
+  // Cross-chunk call cache (m_guest.native_ok): slot per uniform 16 KiB chunk, -1 if none.
+  std::vector<u8> m_native_ok;
+  std::vector<int> m_chunk_slot;
+  void ResetNativeOk()
+  {
+    std::fill(m_native_ok.begin(), m_native_ok.end(), u8{0});
+  }
   mutable std::vector<u8> m_chunk_host_call_state;
   std::vector<StaticRecompRange> m_forced_fallback_ranges;
   struct ActiveRelSection

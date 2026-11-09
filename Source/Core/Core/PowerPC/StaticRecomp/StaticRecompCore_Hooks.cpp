@@ -1,6 +1,11 @@
 // RecompCore: StaticRecomp CPU core - Memory and instruction fallback HLE hooks.
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <optional>
+#include <cstdlib>
+#include <unordered_map>
+#include <vector>
 #include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
 #include "Core/System.h"
 #include "Core/PowerPC/MMU.h"
@@ -9,6 +14,7 @@
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
 #include "Core/HW/GPFifo.h"
+#include "Core/HW/Memmap.h"
 #include "Core/HW/SystemTimers.h"
 #include "Common/Logging/Log.h"
 
@@ -40,20 +46,139 @@ bool StaticRecompCore::HookHostCall(CPUState* cpu, u32 address)
     // must go through the chassis, which only idles when it sees that pc.
     if (core->m_idle_pc != 0 && cpu->lr == core->m_idle_pc)
       return true;
+    // Fast path for the common case (no RELs, no forced fallback ranges): two table
+    // lookups. The per-chunk host-call state is filled for every chunk at module load,
+    // and a chunk without a host call can't hold a host-call target.
+    if (!core->m_has_rel_modules && core->m_module_active &&
+        core->m_forced_fallback_ranges.empty() && !core->m_chunk_lookup_table.empty())
+    {
+      const int ti = core->GetAddressLookupIndex(target);
+      const int ci = core->GetAddressLookupIndex(cpu->lr);
+      const int n = static_cast<int>(core->m_chunk_lookup_table.size());
+      if (ti >= 0 && ti < n && ci >= 0 && ci < n)
+      {
+        const int tc = core->m_chunk_lookup_table[ti];
+        const int cc = core->m_chunk_lookup_table[ci];
+        if (tc >= 0 && cc >= 0 && core->m_chunk_state[tc] == CHUNK_VERIFIED &&
+            core->m_chunk_host_call_state[tc] == 1 && core->m_chunk_host_call_state[cc] == 1)
+        {
+          // Remember both for the inline check (the caller is running natively: verified).
+          if (!core->m_native_ok.empty() && core->m_chunk_state[cc] == CHUNK_VERIFIED &&
+              core->m_chunk_slot[tc] >= 0 && core->m_chunk_slot[cc] >= 0)
+          {
+            core->m_native_ok[core->m_chunk_slot[tc]] = 1;
+            core->m_native_ok[core->m_chunk_slot[cc]] = 1;
+          }
+          return false;
+        }
+      }
+    }
     if (core->m_has_rel_modules || !core->m_module_active || !core->FastDispatchableAt(target) ||
         core->IsHostCallAddress(target))
       return true;
     const int index = core->ChunkIndexOf(target);
-    return index < 0 || core->ChunkContainsHostCall(static_cast<u32>(index));
+    // The caller goes on natively after the call: not if a hook (a mod patch)
+    // is in its chunk, as the return would skip it (skip-intro's patch sits
+    // right after a bl).
+    const int caller = core->ChunkIndexOf(cpu->lr);
+    return index < 0 || core->ChunkContainsHostCall(static_cast<u32>(index)) || caller < 0 ||
+           core->ChunkContainsHostCall(static_cast<u32>(caller));
   }
   return core->m_module_source.host_call &&
          core->m_module_source.host_call(cpu, address, core->m_module_source.host_call_user);
+}
+
+// After a real MMU access to a page-table-mapped address (its PTE's R/C bits now set), cache the
+// page's host pointer for the generated code (gx_vtlb_ptr in GXRuntime cpu.h).
+static bool MmioStats();
+
+void StaticRecompCore::FillVtlb(StaticRecompCore* core, CPUState* cpu, u32 ea, bool write)
+{
+  // Lockstep verification needs every access to reach the MMU.
+  if (!cpu->vtlb || !(cpu->msr & PPC_MSR_DR) || ea >= 0x80000000u ||
+      core->m_lockstep_verifier->IsEnabled())
+  {
+    if (MmioStats() && ea < 0x80000000u && (ea >> 24) == 0x7E)
+    {
+      static int n;
+      if (n++ < 8)
+        std::fprintf(stderr, "[vtlb] skip ea=%08X vtlb=%p msr=%08X lockstep=%d\n", ea,
+                     static_cast<void*>(cpu->vtlb), cpu->msr,
+                     core->m_lockstep_verifier->IsEnabled() ? 1 : 0);
+    }
+    return;
+  }
+  const std::optional<u32> phys = core->m_system.GetMMU().GetTranslatedAddress(ea);
+  // Without MMU emulation Dolphin backs 0x7E000000-0x7FFFFFFF with "fake VMEM" (the game's
+  // ARAM-backed virtual memory); cache those pages too.
+  auto& memory = core->m_system.GetMemory();
+  if (phys && memory.GetFakeVMEM() && (*phys & 0xFE000000u) == 0x7E000000u)
+  {
+    GXVTlbEntry& e = cpu->vtlb[((ea >> 12) & (GX_VTLB_SIZE - 1u)) + (write ? GX_VTLB_SIZE : 0u)];
+    e.vpage = ea >> 12;
+    e.sr = cpu->sr[ea >> 28];
+    e.epoch = cpu->vtlb_epoch;
+    e.host = memory.GetFakeVMEM() + ((*phys & memory.GetFakeVMemMask()) & ~0xFFFu);
+    return;
+  }
+  if (!phys || *phys >= cpu->ram_size || cpu->ram_size - (*phys & ~0xFFFu) < 0x1000u)
+  {
+    if (MmioStats())
+    {
+      static int n;
+      if (n++ < 8)
+        std::fprintf(stderr, "[vtlb] no-map ea=%08X phys=%08X ok=%d ram_size=%08X\n", ea,
+                     phys ? *phys : 0u, phys ? 1 : 0, cpu->ram_size);
+    }
+    return;
+  }
+  if (MmioStats())
+  {
+    static unsigned n;
+    if ((n++ & 0x3FFFFu) == 0)  // every 256K fills: is the epoch moving?
+      std::fprintf(stderr, "[vtlb] n=%u fill ea=%08X phys=%08X sr=%08X epoch=%u w=%d\n", n, ea, *phys,
+                   cpu->sr[ea >> 28], cpu->vtlb_epoch, write ? 1 : 0);
+  }
+  GXVTlbEntry& e = cpu->vtlb[((ea >> 12) & (GX_VTLB_SIZE - 1u)) + (write ? GX_VTLB_SIZE : 0u)];
+  e.vpage = ea >> 12;
+  e.sr = cpu->sr[ea >> 28];
+  e.epoch = cpu->vtlb_epoch;
+  e.host = cpu->ram + (*phys & ~0xFFFu);
+}
+
+// STATICRECOMP_MMIO_STATS=1: count slow-path (non-RAM) guest accesses per 4 KiB page and
+// print the top pages every 4M accesses, to find what the native fast path misses.
+// Read on first use: iOS sets environment variables from Documents/env.txt after static init.
+static bool MmioStats()
+{
+  static const bool enabled = std::getenv("STATICRECOMP_MMIO_STATS") != nullptr;
+  return enabled;
+}
+
+static void CountExternalAccess(u32 ea, bool write)
+{
+  static std::unordered_map<u32, u64> pages;
+  static u64 total = 0;
+  ++pages[(ea & ~0xFFFu) | (write ? 1u : 0u)];
+  if ((++total & ((1u << 22) - 1)) != 0)
+    return;
+  std::vector<std::pair<u64, u32>> top;
+  for (const auto& [page, count] : pages)
+    top.emplace_back(count, page);
+  std::sort(top.rbegin(), top.rend());
+  std::fprintf(stderr, "[mmio] total=%llu", static_cast<unsigned long long>(total));
+  for (size_t i = 0; i < top.size() && i < 10; ++i)
+    std::fprintf(stderr, " %08X%s:%llu", top[i].second & ~1u, (top[i].second & 1u) ? "w" : "r",
+                 static_cast<unsigned long long>(top[i].first));
+  std::fprintf(stderr, "\n");
 }
 
 u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
 {
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   ea = core->TranslateRelAddress(ea);
+  if (MmioStats())
+    CountExternalAccess(ea, false);
   if (ea == 0)
     std::fprintf(stderr, "[zero-access] read size=%u guest_pc=%08x ppc_pc=%08x lr=%08x\n", size,
                  cpu->pc, core->m_system.GetPPCState().pc, cpu->lr);
@@ -83,6 +208,7 @@ u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
   {
     core->m_lockstep_verifier->m_journal.native_reads.push_back({ea, static_cast<u32>(value), size});
   }
+  FillVtlb(core, cpu, ea, false);
   return value;
 }
 
@@ -90,6 +216,8 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
 {
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   ea = core->TranslateRelAddress(ea);
+  if (MmioStats())
+    CountExternalAccess(ea, true);
   if (ea == 0)
     std::fprintf(stderr, "[zero-access] write size=%u guest_pc=%08x ppc_pc=%08x lr=%08x\n", size,
                  cpu->pc, core->m_system.GetPPCState().pc, cpu->lr);
@@ -104,16 +232,23 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
     if (core->m_lockstep_verifier->m_ls_journaling)
       core->m_lockstep_verifier->m_journal.native_mmio.push_back({ea, static_cast<u32>(value), size});
     auto& gpfifo = core->m_system.GetGPFifo();
+    // Not Write*(): its CheckGatherPipe also calls CompileExceptionCheck, which
+    // keys on ppc.pc (stale during a native burst) and so only registers junk
+    // addresses / invalidates unrelated blocks. FastWrite + FastCheckGatherPipe
+    // does the same pipe update without it.
     switch (size)
     {
     case 1:
-      gpfifo.Write8(static_cast<u8>(value));
+      gpfifo.FastWrite8(static_cast<u8>(value));
+      gpfifo.FastCheckGatherPipe();
       return;
     case 2:
-      gpfifo.Write16(static_cast<u16>(value));
+      gpfifo.FastWrite16(static_cast<u16>(value));
+      gpfifo.FastCheckGatherPipe();
       return;
     case 4:
-      gpfifo.Write32(static_cast<u32>(value));
+      gpfifo.FastWrite32(static_cast<u32>(value));
+      gpfifo.FastCheckGatherPipe();
       return;
     default:
       for (u32 i = size * 8u; i > 0;)
@@ -148,8 +283,9 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
     break;
   default:
     ERROR_LOG_FMT(POWERPC, "StaticRecomp: external write of bad size {} at 0x{:08X}", size, ea);
-    break;
+    return;
   }
+  FillVtlb(core, cpu, ea, true);
 }
 
 u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
@@ -253,6 +389,10 @@ void StaticRecompCore::HookSPRWrite(CPUState* cpu, u16 spr, u32 value, u32 cia)
 
   const u32 old_value = ppc.spr[spr];
   ppc.spr[spr] = value;
+  // Page table base and BATs change what a virtual page maps to.
+  if (spr == SPR_SDR || (spr >= SPR_IBAT0U && spr <= SPR_DBAT3L) ||
+      (spr >= SPR_IBAT4U && spr <= SPR_DBAT7L))
+    ++cpu->vtlb_epoch;
 
   switch (spr)
   {

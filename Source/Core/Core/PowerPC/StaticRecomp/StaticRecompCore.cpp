@@ -8,6 +8,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include "Common/Config/Config.h"
 #include "Common/DynamicLibrary.h"
@@ -143,6 +148,46 @@ StaticRecompCore::StaticRecompCore(Core::System& system, StaticRecompModuleSourc
 
 StaticRecompCore::~StaticRecompCore() = default;
 
+// STATICRECOMP_PC_PROFILE=<file>: samples the guest pc every 0.5 ms and
+// writes "count pc" lines at shutdown (most first), for finding hot code.
+namespace
+{
+std::thread s_pc_sampler;
+std::atomic<bool> s_pc_sampling{false};
+std::unordered_map<u32, u32> s_pc_samples;
+
+void StartPCSampler(const CPUState* guest)
+{
+  if (!std::getenv("STATICRECOMP_PC_PROFILE"))
+    return;
+  s_pc_sampling = true;
+  s_pc_sampler = std::thread([guest] {
+    while (s_pc_sampling)
+    {
+      const u32 pc = *reinterpret_cast<const volatile u32*>(&guest->pc);
+      ++s_pc_samples[pc];
+      std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+  });
+}
+
+void StopPCSampler()
+{
+  if (!s_pc_sampling)
+    return;
+  s_pc_sampling = false;
+  s_pc_sampler.join();
+  std::vector<std::pair<u32, u32>> v(s_pc_samples.begin(), s_pc_samples.end());
+  std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+  if (FILE* f = std::fopen(std::getenv("STATICRECOMP_PC_PROFILE"), "w"))
+  {
+    for (auto& [pc, n] : v)
+      std::fprintf(f, "%u %08x\n", n, pc);
+    std::fclose(f);
+  }
+}
+}  // namespace
+
 void StaticRecompCore::Init()
 {
   g_static_recomp_core = this;
@@ -182,6 +227,7 @@ void StaticRecompCore::Init()
 
   LoadModule();
   m_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
+  StartPCSampler(&m_guest);
   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
   m_lockstep_verifier->Init();
 
@@ -192,6 +238,8 @@ void StaticRecompCore::Init()
 #elif defined(_M_X86_64)
   m_fallback_jit = std::make_unique<Jit64>(m_system);
 #endif
+  if (std::getenv("STATICRECOMP_NO_JIT"))  // the iOS path (interpreter), for testing on a Mac
+    m_fallback_jit.reset();
   if (m_fallback_jit)
   {
     m_fallback_jit->SetStaticRecompFallback(true);
@@ -203,6 +251,7 @@ void StaticRecompCore::Init()
 void StaticRecompCore::Shutdown()
 {
   g_static_recomp_core = nullptr;
+  StopPCSampler();
   std::fprintf(stderr,
                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
                "smc_failed=%u verifications=%llu reverify_events=%llu bursts=%llu cycles=%llu\n",
@@ -270,6 +319,8 @@ void StaticRecompCore::LoadModule()
 
   const auto reject = [&](const std::string& why) {
     ERROR_LOG_FMT(POWERPC, "StaticRecomp: rejecting module '{}': {}. Interpreter-only.", path, why);
+    std::fprintf(stderr, "[staticrecomp] rejecting module '%s': %s. Interpreter-only.\n", path.c_str(),
+                 why.c_str());
     m_module = nullptr;
     if (m_library.IsOpen())
       m_library.Close();
@@ -308,6 +359,9 @@ void StaticRecompCore::LoadModule()
   m_module_active = (desc != nullptr);
   m_has_rel_modules = desc->num_rel_modules != 0;
   m_chunk_state.assign(desc->num_chunk_ranges, CHUNK_UNVERIFIED);
+  m_chunk_slot.clear();  // rebuilt for this module in Run()
+  m_native_ok.clear();
+  m_guest.native_ok = nullptr;
   m_chunk_host_call_state.assign(desc->num_chunk_ranges, 0);
   m_effective_chunk_hashes.assign(desc->chunk_hashes,
                                   desc->chunk_hashes + desc->num_chunk_ranges);
@@ -352,12 +406,14 @@ void StaticRecompCore::LoadModule()
 
 void StaticRecompCore::ClearCache()
 {
+  ++m_guest.vtlb_epoch;  // the page table may have changed (state load)
   if (m_fallback_jit)
     m_fallback_jit->ClearCache();
 
   if (!m_module)
     return;
   std::fill(m_chunk_state.begin(), m_chunk_state.end(), u8{CHUNK_UNVERIFIED});
+  ResetNativeOk();
   m_failed_chunks = 0;
   ++m_reverify_events;
 }
@@ -366,4 +422,13 @@ void StaticRecompPerfCounters(u64* native, u64* fallback)
 {
   *native = g_static_recomp_core ? g_static_recomp_core->NativeDispatches() : 0;
   *fallback = g_static_recomp_core ? g_static_recomp_core->FallbackSteps() : 0;
+}
+
+// For the iOS perf log (read from another thread: a snapshot, may be torn).
+void StaticRecompGuestRegs(u32* pc, u32* lr, u32* sp)
+{
+  const CPUState* guest = g_static_recomp_core ? &g_static_recomp_core->Guest() : nullptr;
+  *pc = guest ? guest->pc : 0;
+  *lr = guest ? guest->lr : 0;
+  *sp = guest ? guest->gpr[1] : 0;
 }

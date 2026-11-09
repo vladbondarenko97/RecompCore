@@ -111,6 +111,12 @@ if(GENERATED_HEADER_TEXT MATCHES "dolrecomp_call__x86_64_v3")
   target_compile_definitions(${MODULE_NAME} PRIVATE
     DOLRECOMP_MODULE_HAVE_X86_64_V3=1)
 endif()
+# GameCube discs have no MEM2: skip the EXRAM probe and the lockstep write
+# journal on every guest load/store. -DGC_FAST_MEM=OFF for lockstep runs.
+option(GC_FAST_MEM "GameCube-only guest memory fast path" ON)
+if(GC_FAST_MEM AND GAME_ID MATCHES "^G")
+  target_compile_definitions(${MODULE_NAME} PRIVATE GXRUNTIME_GC_FAST_MEM=1)
+endif()
 
 target_include_directories(${MODULE_NAME} PRIVATE
   "${GENERATED_DIR}"
@@ -131,10 +137,10 @@ endif()
 option(RECOMPCORE_MODULE_ENABLE_IPO "Enable Clang module interprocedural optimization when supported" ON)
 set(RECOMPCORE_MODULE_OPT_LEVEL "2" CACHE STRING
     "Optimization level for generated module translation units (0, 1, 2, or 3)")
-set_property(CACHE RECOMPCORE_MODULE_OPT_LEVEL PROPERTY STRINGS 0 1 2 3)
-if(NOT RECOMPCORE_MODULE_OPT_LEVEL MATCHES "^[0-3]$")
+set_property(CACHE RECOMPCORE_MODULE_OPT_LEVEL PROPERTY STRINGS 0 1 2 3 s z)
+if(NOT RECOMPCORE_MODULE_OPT_LEVEL MATCHES "^[0-3sz]$")
   message(FATAL_ERROR
-    "RECOMPCORE_MODULE_OPT_LEVEL must be one of 0, 1, 2, or 3")
+    "RECOMPCORE_MODULE_OPT_LEVEL must be one of 0, 1, 2, 3, s or z")
 endif()
 if(RECOMPCORE_MODULE_ENABLE_IPO AND CMAKE_C_COMPILER_ID MATCHES "Clang")
   include(CheckIPOSupported)
