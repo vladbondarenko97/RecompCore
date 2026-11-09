@@ -483,6 +483,19 @@ void MMU::GenerateDSIException(u32 effective_address, bool write)
   // DSI exceptions are only supported in MMU mode.
   if (!m_system.IsMMUMode())
   {
+    // A game stuck writing through a bad pointer hits this millions of times a second: log the
+    // first 20 and then one per million (a 4 GB log filled an iPad).
+    static u64 s_invalid_accesses = 0;
+    const u64 n = s_invalid_accesses++;
+    if (n >= 20 && n % 1000000 != 0)
+    {
+      if (m_system.IsPauseOnPanicMode())
+      {
+        m_system.GetCPU().Break();
+        m_ppc_state.Exceptions |= EXCEPTION_DSI | EXCEPTION_FAKE_MEMCHECK_HIT;
+      }
+      return;
+    }
     if (write)
     {
       PanicAlertFmtT(
